@@ -478,12 +478,8 @@ func stepInstruction(g ProofContextExt, ins *jsonw.Wrapper, state ScriptState) (
 }
 
 func stepAssertRegexMatch(g ProofContextExt, ins *jsonw.Wrapper, state ScriptState) (ScriptState, libkb.ProofError) {
-	template, err := ins.AtKey(string(CmdAssertRegexMatch)).GetString()
-	if err != nil {
-		return state, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
-			"Could not get regex template")
-	}
-	re, perr := interpretRegex(g, template, state)
+	rspec := ins.AtKey(string(CmdAssertRegexMatch))
+	re, template, perr := interpretRegex(g, state, rspec)
 	if perr != nil {
 		return state, perr
 	}
@@ -519,12 +515,8 @@ func stepWhitespaceNormalize(g ProofContextExt, ins *jsonw.Wrapper, state Script
 }
 
 func stepRegexCapture(g ProofContextExt, ins *jsonw.Wrapper, state ScriptState) (ScriptState, libkb.ProofError) {
-	template, err := ins.AtKey(string(CmdRegexCapture)).GetString()
-	if err != nil {
-		return state, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
-			"not get regex template")
-	}
-	re, perr := interpretRegex(g, template, state)
+	rspec := ins.AtKey(string(CmdRegexCapture))
+	re, template, perr := interpretRegex(g, state, rspec)
 	if perr != nil {
 		return state, perr
 	}
@@ -673,20 +665,16 @@ func stepSelectorCSS(g ProofContextExt, ins *jsonw.Wrapper, state ScriptState) (
 }
 
 func stepTransformURL(g ProofContextExt, ins *jsonw.Wrapper, state ScriptState) (ScriptState, libkb.ProofError) {
-	sourceTemplate, err := ins.AtKey(string(CmdTransformURL)).GetString()
-	if err != nil {
-		return state, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
-			"Could not get regex template for transformation")
+	sourceRspec := ins.AtKey(string(CmdTransformURL))
+	re, sourceTemplate, perr := interpretRegex(g, state, sourceRspec)
+	if perr != nil {
+		return state, perr
 	}
+
 	destTemplate, err := ins.AtKey("to").GetString()
 	if err != nil {
 		return state, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
 			"Could not get dest pattern for transformation")
-	}
-
-	re, perr := interpretRegex(g, sourceTemplate, state)
-	if perr != nil {
-		return state, perr
 	}
 
 	match := re.FindStringSubmatch(state.FetchURL)
@@ -811,25 +799,74 @@ func runSelectorJSONInner(g ProofContextExt, state ScriptState, object *jsonw.Wr
 		"Selector entry not recognized: %v", selector)
 }
 
-// Take a template, substitute variables, and build the Regexp.
-func interpretRegex(g ProofContextExt, template string, state ScriptState) (*regexp.Regexp, libkb.ProofError) {
-	var perr libkb.ProofError = libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
-		"Could not build regex %v", template)
+type regexSpec struct {
+	template string
+	opts     string
+}
 
-	// Parse out bookends (^$) and option letters.
+// interpretRegex turns a spec like ["^I am %{username_keybase}"] into a regex.
+func interpretRegex(g ProofContextExt, state ScriptState, spec *jsonw.Wrapper) (*regexp.Regexp, string, libkb.ProofError) {
+	rspec, err := extractRegexSpec(g, state, spec)
+	if err != nil {
+		return nil, "", err
+	}
+	re, err := interpretRegexInner(g, state, rspec.template, rspec.opts)
+	if err != nil {
+		return nil, "", err
+	}
+	return re, rspec.template, nil
+}
+
+func extractRegexSpec(g ProofContextExt, state ScriptState, spec *jsonw.Wrapper) (regexSpec, libkb.ProofError) {
+	ar, err := spec.ToArray()
+	if err != nil {
+		return regexSpec{}, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Regex spec must be an array")
+	}
+	length, err := ar.Len()
+	if err != nil {
+		return regexSpec{}, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Could not get length of regex spec array")
+	}
+	if length < 1 || length > 2 {
+		return regexSpec{}, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Regex spec must be of length 1 or 2 but was %v", length)
+	}
+	template, err := ar.AtIndex(0).GetString()
+	if err != nil {
+		return regexSpec{}, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Could not get regex template: %v", err)
+	}
+	if !ar.AtIndex(1).IsNil() {
+		opts, err := ar.AtIndex(1).GetString()
+		if err != nil {
+			return regexSpec{}, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+				"Could not get regex options: %v", err)
+		}
+		return regexSpec{template, opts}, nil
+	}
+	return regexSpec{template, ""}, nil
+}
+
+// Take a template, substitute variables, and build the Regexp.
+func interpretRegexInner(g ProofContextExt, state ScriptState, template string, opts string) (*regexp.Regexp, libkb.ProofError) {
+	// Check that regex is bounded by "^" and "$".
 	if !strings.HasPrefix(template, "^") {
-		return nil, perr
+		return nil, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Could not build regex: %v (%v)", "must start with '^'", template)
 	}
-	lastDollar := strings.LastIndex(template, "$")
-	if lastDollar == -1 {
-		return nil, perr
+	if !strings.HasSuffix(template, "$") {
+		return nil, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
+			"Could not build regex: %v (%v)", "must end with '$'", template)
 	}
-	opts := template[lastDollar+1:]
+
+	// Check that only valid options are given.
 	if !regexp.MustCompile("[imsU]*").MatchString(opts) {
 		return nil, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
 			"Could not build regex: %v (%v)", "invalid options", template)
 	}
-	var prefix = ""
+
+	// Check that no options are duplicated.
 	optmap := make(map[rune]bool)
 	for _, opt := range opts {
 		optmap[opt] = true
@@ -838,12 +875,14 @@ func interpretRegex(g ProofContextExt, template string, state ScriptState) (*reg
 		return nil, libkb.NewProofError(keybase1.ProofStatus_INVALID_PVL,
 			"Could not build regex: %v (%v)", "duplicate options", template)
 	}
+
+	var prefix = ""
 	if len(opts) > 0 {
 		prefix = "(?" + opts + ")"
 	}
 
 	// Do variable interpolation.
-	prepattern, perr := substitute(template[0:lastDollar+1], state, nil)
+	prepattern, perr := substitute(template, state, nil)
 	if perr != nil {
 		return nil, perr
 	}
